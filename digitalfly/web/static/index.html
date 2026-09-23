@@ -393,6 +393,7 @@ let rimg = null, rx = 0;
 function drawRaster(col){
   const cv = $('#raster'); const {g,w,h} = fitDPR(cv);
   const W = Math.floor(w), H = Math.floor(h);
+  if (W <= 0 || H <= 0) return;   // 面板切换瞬间画布可能还没排好版，宽/高为 0
   if (!rimg || rimg.width !== W || rimg.height !== H){
     rimg = g.createImageData(W,H); rx = 0;
     const d = rimg.data;
@@ -442,14 +443,24 @@ fetch('/api/info').then(r=>r.json()).then(info=>{
     b.textContent = label; b.dataset.k = k;
     if (k === info.behavior) b.className = 'on';
     b.onclick = async () => {
+      // 切换要重建整个 MuJoCo 模型，几秒钟是常态；不给提示的话看着像点了没反应。
+      const buttons = bwrap.querySelectorAll('button');
+      buttons.forEach(x => x.disabled = true);
+      const prevLabel = b.textContent;
+      b.textContent = '切换中…';
       bwrap.querySelectorAll('button').forEach(x=>x.className='');
       b.className = 'on'; curBehavior = k;
       $('#behaviorNote').textContent = NOTES[k];
       $('#foodCard').style.display = (k==='forage') ? '' : 'none';
       $('#cubeCard').style.display = (k==='cube') ? '' : 'none';
       hist.brain.length = hist.mn9.length = hist.dn.length = 0; rimg = null;
-      await post({action:'behavior', value:k});
-      fetch('/api/info').then(r=>r.json()).then(renderCameras);
+      try {
+        await post({action:'behavior', value:k});
+        fetch('/api/info').then(r=>r.json()).then(renderCameras);
+      } finally {
+        b.textContent = prevLabel;
+        buttons.forEach(x => x.disabled = false);
+      }
     };
     bwrap.appendChild(b);
   }

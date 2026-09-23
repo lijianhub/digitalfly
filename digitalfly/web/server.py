@@ -93,6 +93,15 @@ class Simulation:
         self.odor_on = True
         self.camera = "track1"
 
+        # 试过让渲染窗口（GLContext）跨行为切换常驻复用、只重建身体模型专属的
+        # 渲染资源——概念上更稳，但真实 flybody 模型规模下会在某些切换上报
+        # "Default framebuffer is not complete"（简化复现没能重现，怀疑和不同
+        # 模式模型的 visual/offwidth 配置差异有关，需要更多时间排查），而且
+        # 失败时会让当前身体对象处于"渲染资源已释放但没建成新的"的半销毁状态，
+        # 反而让渲染线程跟着挂。先退回更简单可靠的每次切换重开窗口，只保留这次
+        # 定位到的关键修复：FlyBody.close() 释放 GPU 资源前要先在当前线程
+        # make_current（原始代码没做这一步，大概率是反复切换后资源逐渐泄漏、
+        # 最终顶不住的真正原因）。
         self.body = None
         self.behavior = None
         self.recognizer = None
@@ -253,6 +262,13 @@ class Simulation:
                 self.error = f"{type(e).__name__}: {e}"
                 self.running = False
                 continue
+            # 这个循环刻意不做真实的限速（"全速"跑脑），但完全不睡眠的热循环
+            # 会一直抢着 GIL —— Windows 上 GIL 的线程唤醒粒度比 Linux 粗很多，
+            # 渲染/物理线程会被饿得几乎拿不到执行权（实测:单独跑渲染 419 FPS、
+            # 物理每块 13.5ms，三线程一起跑却只有 ~5 FPS）。sleep(0) 只是"尽力
+            # 让出"，在 Windows 上不保证真的触发一次调度切换，实测只从 5 FPS
+            # 提到 9.4 FPS；换成 1ms 真实睡眠，强制走一次等待/唤醒。
+            time.sleep(0.001)
 
             window += spikes
             window_steps += 1

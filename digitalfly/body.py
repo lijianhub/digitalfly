@@ -55,6 +55,19 @@ LEG_JOINTS = ("coxa_abduct", "coxa_twist", "coxa", "femur_twist",
               "femur", "tibia", "tarsus", "tarsus2")
 
 
+def make_shared_gl_context(render_size=(360, 480)):
+    """建一个跨行为切换常驻复用的 GLContext，传给 `FlyBody(gl_context=...)`。
+
+    `render_size` 和 `FlyBody(render_size=...)` 同一个约定：(高, 宽)。
+    只应该在整个进程/长驻服务（如 web 端）的生命周期里建一次，在真正开始渲染
+    循环之前、且在主线程上建（GLFW 建窗口只能在主线程做）。见 FlyBody.__init__
+    里对反复开关窗口这个坑的说明。
+    """
+    from mujoco.rendering.classic import gl_context as _glctx_mod
+    h, w = render_size
+    return _glctx_mod.GLContext(w, h) if _glctx_mod.GLContext is not None else None
+
+
 class FlyBody:
     """MuJoCo 果蝇身体。
 
@@ -65,7 +78,8 @@ class FlyBody:
     """
 
     def __init__(self, mode: str = "walk", render_size=(480, 640),
-                 floor: bool = True, cube_scene=None, **overrides):
+                 floor: bool = True, cube_scene=None, gl_context=None,
+                 **overrides):
         import mujoco
         from dm_control import mjcf
         from dm_control.locomotion.arenas import floors
@@ -124,7 +138,33 @@ class FlyBody:
         self.model = self.physics.model.ptr
         self.data = self.physics.data.ptr
         self.h, self.w = render_size
-        self._renderer = None
+        # 渲染分两层：GL 窗口/上下文（GLContext）和绑定具体模型的 GPU 资源
+        # （mjr_context/scene）。`gl_context` 参数支持调用方传一个常驻复用的
+        # GLContext 进来跨多个 Body 共享——本想让 Web 端切换行为时只换模型专属
+        # 资源、不重开窗口，因为反复开关窗口会让这台机器的混合显卡 WGL 驱动
+        # 状态越切越坏，切七八次后新窗口建不起来、渲染线程卡死。但真实
+        # flybody 模型规模下常驻复用会在某些切换上报 "Default framebuffer is
+        # not complete"（原因未完全定位，怀疑和不同模式模型的 offwidth/
+        # offheight 配置差异有关），所以 Web 端目前没有用这条路径
+        # （`gl_context=None`，退回下面自建窗口这支）。
+        #
+        # 真正解决切换变卡的是 close() 里的顺序修复：释放 GPU 资源前必须先在
+        # 当前线程 make_current；原始代码是先整个销毁 GLContext（窗口）再释放
+        # mjr_context，这时上下文已经没了，mjr_context.free() 的 GL 调用全部
+        # 打空——GPU 资源每次切换都在泄漏，这才是反复切换后逐渐卡死的真正原因。
+        #
+        # `gl_context` 参数留着给以后想再尝试常驻复用的调用方用；不传时
+        # （目前 web 端就是这样）这里自己建一个、随这个 Body 的生命周期走的
+        # 窗口，`close()` 时一并销毁。
+        if gl_context is not None:
+            self._gl_context = gl_context
+            self._owns_gl_context = False
+        else:
+            from mujoco.rendering.classic import gl_context as _glctx_mod
+            self._gl_context = (_glctx_mod.GLContext(self.w, self.h)
+                                 if _glctx_mod.GLContext is not None else None)
+            self._owns_gl_context = True
+        self._build_render_context()
         # 自由视角的状态（方位角 / 仰角 / 距离），由 Web 端鼠标拖动驱动
         self._orbit_cam = None
         self._orbit = {"azimuth": 135.0, "elevation": -20.0, "distance": 1.4}
@@ -298,20 +338,88 @@ class FlyBody:
             cam.lookat[:] = self.root_pos
         return cam
 
+    def _build_render_context(self) -> None:
+        """建这个模型专属的 mjv_scene / mjr_context。
+
+        和 GLContext（窗口/GL 上下文）分开：这两个是绑定当前 self.model 的
+        GPU 资源（geom 数量、mesh 上传等），模型一换必须重建；但重建它们不
+        涉及开关窗口，便宜很多，也不会累积破坏 WGL 状态。等价于
+        mujoco.Renderer.__init__ 里除了建 GLContext 之外的那部分。
+        """
+        if self._gl_context is not None:
+            self._gl_context.make_current()
+        self._scene = self.mj.MjvScene(self.model, maxgeom=10000)
+        self._scene_option = self.mj.MjvOption()
+        self._rect = self.mj.MjrRect(0, 0, self.w, self.h)
+        self._mjr_context = self.mj.MjrContext(
+            self.model, self.mj.mjtFontScale.mjFONTSCALE_150.value)
+        self.mj.mjr_setBuffer(
+            self.mj.mjtFramebuffer.mjFB_OFFSCREEN.value, self._mjr_context)
+        self._mjr_context.readDepthMap = self.mj.mjtDepthMap.mjDEPTH_ZEROFAR
+        # 建的时候会把上下文 make_current 在"建它的线程"上（这里跨行为切换是
+        # Flask 请求线程，不是渲染线程）。WGL 的上下文同一时间只能在一个线程
+        # 上 current，不释放的话渲染线程下一次 render() 再抢就会失败。render()
+        # 每次调用都会自己重新 make_current，所以这里放手完全安全。
+        try:
+            import glfw
+            glfw.make_context_current(None)
+        except Exception:                                    # noqa: BLE001
+            pass
+
     def render(self, camera: str | int = -1) -> np.ndarray:
-        if self._renderer is None:
-            self._renderer = self.mj.Renderer(self.model, self.h, self.w)
         if camera == "orbit":
-            self._renderer.update_scene(self.data, camera=self._orbit_camera())
-            return self._renderer.render()
-        cam = camera
-        if isinstance(camera, str):
-            cam = (self.camera_names.index(camera)
-                   if camera in self.camera_names else -1)
-        self._renderer.update_scene(self.data, camera=cam)
-        return self._renderer.render()
+            cam = self._orbit_camera()
+        elif isinstance(camera, str):
+            cam_id = (self.camera_names.index(camera)
+                      if camera in self.camera_names else -1)
+            cam = self.mj.MjvCamera()
+            cam.fixedcamid = cam_id
+            if cam_id == -1:
+                cam.type = self.mj.mjtCamera.mjCAMERA_FREE
+                self.mj.mjv_defaultFreeCamera(self.model, cam)
+            else:
+                cam.type = self.mj.mjtCamera.mjCAMERA_FIXED
+        else:
+            cam = self.mj.MjvCamera()
+            cam.fixedcamid = camera
+            if camera == -1:
+                cam.type = self.mj.mjtCamera.mjCAMERA_FREE
+                self.mj.mjv_defaultFreeCamera(self.model, cam)
+            else:
+                cam.type = self.mj.mjtCamera.mjCAMERA_FIXED
+
+        if self._gl_context is not None:
+            self._gl_context.make_current()
+        self.mj.mjv_updateScene(
+            self.model, self.data, self._scene_option, None, cam,
+            self.mj.mjtCatBit.mjCAT_ALL.value, self._scene)
+        out = np.empty((self.h, self.w, 3), dtype=np.uint8)
+        self.mj.mjr_render(self._rect, self._scene, self._mjr_context)
+        self.mj.mjr_readPixels(out, None, self._rect, self._mjr_context)
+        out[:] = np.flipud(out)
+        return out
 
     def close(self) -> None:
-        if self._renderer is not None:
-            self._renderer.close()
-            self._renderer = None
+        """释放这个模型专属的渲染资源。
+
+        不动 GLContext（窗口）——它要么是外面传进来、跨行为切换常驻复用的
+        （web 端），要么由 close() 之外的逻辑负责（见下面的 _owns_gl_context
+        分支，覆盖非 web 场景）。
+
+        释放 GPU 资源（mjr_context.free()）前必须先在**当前调用线程**上
+        make_current 一次：上一次 render() 之后上下文是"钉"在渲染线程上的，
+        close() 往往是从另一个线程（比如切换行为的 Flask 请求线程）调用的，
+        不重新认领就去释放，WGL 会报"请求的资源在使用中"。
+        """
+        if self._gl_context is not None:
+            try:
+                self._gl_context.make_current()
+            except Exception:                                # noqa: BLE001
+                pass
+        if self._mjr_context is not None:
+            self._mjr_context.free()
+            self._mjr_context = None
+        self._scene = None
+        if self._owns_gl_context and self._gl_context is not None:
+            self._gl_context.free()
+            self._gl_context = None

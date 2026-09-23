@@ -50,14 +50,22 @@ def remote_size(url: str) -> int | None:
 
 
 def _fetch_range(url: str, start: int, end: int, part: Path) -> int:
-    """下载 [start, end] 字节区间到 part 文件，支持续传。"""
+    """下载 [start, end] 字节区间到 part 文件，支持续传。
+
+    `-C -`（断点续传）和 `-r`（字节范围）在 curl 里是互斥的选项，不能一起传。
+    续传时改为自己算出剩余的字节范围，下载到临时文件后追加到 part 后面。
+    """
     want = end - start + 1
     have = part.stat().st_size if part.exists() else 0
     if have >= want:
         return want
-    p = _curl(["-o", str(part), "-C", "-", "-r", f"{start}-{end}", url])
+    tmp = part.parent / f"{part.name}.tmp"
+    p = _curl(["-o", str(tmp), "-r", f"{start + have}-{end}", url])
     if p.returncode != 0:
         raise RuntimeError(f"分片 {start}-{end} 下载失败: {p.stderr.strip()}")
+    with open(part, "ab") as out, open(tmp, "rb") as src:
+        shutil.copyfileobj(src, out)
+    tmp.unlink()
     got = part.stat().st_size
     if got != want:
         raise RuntimeError(f"分片 {start}-{end} 大小不符: {got} != {want}")
